@@ -1,7 +1,10 @@
 import {
   User,
+  browserPopupRedirectResolver,
+  getRedirectResult,
   onAuthStateChanged,
   signInWithPopup,
+  signInWithRedirect,
   signOut as firebaseSignOut,
 } from 'firebase/auth';
 import {
@@ -17,7 +20,7 @@ import {
   where,
   writeBatch,
 } from 'firebase/firestore';
-import { useCallback, useEffect, useRef, useState } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import {
   OperationType,
   auth,
@@ -41,6 +44,19 @@ import { DEFAULT_PREFERENCES, applyThemeToDocument } from '../utils/themeUtils';
 
 const LOCAL_ITEMS_KEY = 'flowday_items_v1';
 const LOCAL_PREFS_KEY = 'flowday_prefs_v1';
+const LOCAL_SYNC_CODE_KEY = 'flowday_sync_code_v1';
+
+export function normalizeToSyncKey(rawInput: string): string {
+  const cleaned = rawInput
+    .trim()
+    .toLowerCase()
+    .replace(/@/g, '_at_')
+    .replace(/[^a-z0-9_-]+/g, '_')
+    .replace(/^_+|_+$/g, '')
+    .slice(0, 64);
+  if (cleaned.length < 4) return '';
+  return `sync_${cleaned}`;
+}
 
 function generateSafeId(): string {
   const rand = Math.random().toString(36).slice(2, 10);
@@ -131,14 +147,47 @@ function loadLocalPrefs(): UserPreferences {
   }
 }
 
+function loadSavedSyncCode(): string {
+  try {
+    return localStorage.getItem(LOCAL_SYNC_CODE_KEY) || '';
+  } catch {
+    return '';
+  }
+}
+
 function tsToMillis(val: unknown): number {
   if (val instanceof Timestamp) return val.toMillis();
   if (typeof val === 'number') return val;
   return Date.now();
 }
 
+function describeAuthErrorVi(err: unknown): string {
+  const code = (err as { code?: string })?.code ?? '';
+  if (code === 'auth/popup-blocked') {
+    return 'Trình duyệt trên thiết bị đã chặn cửa sổ bật lên (Popup). Bạn có thể bấm "Đăng nhập chuyển trang" hoặc nhập trực tiếp Email / Mã đồng bộ ở khung bên dưới để đồng bộ ngay giữa iPhone và Laptop.';
+  }
+  if (code === 'auth/popup-closed-by-user' || code === 'auth/cancelled-popup-request') {
+    return 'Cửa sổ Google đã đóng hoặc bị khung xem trước chặn kết nối. Hãy dùng khung "Đồng bộ nhanh bằng Email / Mã đồng bộ" ngay bên dưới để đồng bộ trực tiếp không cần cửa sổ bật lên.';
+  }
+  if (code === 'auth/unauthorized-domain') {
+    return 'Tên miền truy cập hiện tại hạn chế cửa sổ Google OAuth. Hãy nhập trực tiếp Email hoặc Mã đồng bộ của bạn ở khung bên dưới để đồng bộ thời gian thực qua Cloud Firestore.';
+  }
+  if (code === 'auth/operation-not-supported-in-this-environment' || code === 'auth/web-storage-unsupported') {
+    return 'Môi trường trình duyệt hiện tại không hỗ trợ cửa sổ Google Popup. Vui lòng nhập Email / Mã đồng bộ ở khung bên dưới để đồng bộ trực tiếp.';
+  }
+  return `Không mở được cửa sổ Google (${code || 'lỗi kết nối'}). Bạn hãy nhập trực tiếp Email hoặc Mã đồng bộ ở khung bên dưới để đồng bộ giữa điện thoại và máy tính.`;
+}
+
+export interface ActiveCloudTarget {
+  mode: 'google' | 'syncKey';
+  ownerId: string; // Firestore userId field value
+  basePath: string; // e.g. 'syncRooms/sync_...' or 'users/uid'
+  displayLabel: string; // e.g. 'borutosolo23@gmail.com'
+}
+
 export function useScheduleStore() {
   const [user, setUser] = useState<User | null>(null);
+  const [syncCodeLabel, setSyncCodeLabel] = useState<string>(() => loadSavedSyncCode());
   const [authReady, setAuthReady] = useState(false);
   const [authLoading, setAuthLoading] = useState(false);
   const [syncError, setSyncError] = useState<string | null>(null);
@@ -151,7 +200,44 @@ export function useScheduleStore() {
   const [cloudLoading, setCloudLoading] = useState(false);
 
   const prefsDocExistsRef = useRef(false);
-  const hasMigratedLocalRef = useRef<string | null>(null);
+  const hasMigratedRef = useRef<string | null>(null);
+
+  // Determine active cloud target (either via Google Sign-In or Direct Sync Code/Email)
+  const cloudTarget = useMemo<ActiveCloudTarget | null>(() => {
+    if (user) {
+      if (user.email) {
+        const key = normalizeToSyncKey(user.email);
+        if (key) {
+          return {
+            mode: 'google',
+            ownerId: key,
+            basePath: `syncRooms/${key}`,
+            displayLabel: user.email,
+          };
+        }
+      }
+      return {
+        mode: 'google',
+        ownerId: user.uid,
+        basePath: `users/${user.uid}`,
+        displayLabel: user.displayName || user.email || 'Tài khoản Google',
+      };
+    }
+
+    if (syncCodeLabel.trim()) {
+      const key = normalizeToSyncKey(syncCodeLabel);
+      if (key) {
+        return {
+          mode: 'syncKey',
+          ownerId: key,
+          basePath: `syncRooms/${key}`,
+          displayLabel: syncCodeLabel.trim(),
+        };
+      }
+    }
+
+    return null;
+  }, [user, syncCodeLabel]);
 
   // Apply theme CSS custom properties and dark mode whenever preferences or OS scheme changes
   useEffect(() => {
@@ -167,16 +253,14 @@ export function useScheduleStore() {
     }
   }, [preferences.themeMode, preferences.accentColor]);
 
-  // Persist locally when signed out (and keep local cache warm)
+  // Keep local storage cache updated so offline mode always has the latest schedule
   useEffect(() => {
-    if (!user) {
-      try {
-        localStorage.setItem(LOCAL_ITEMS_KEY, JSON.stringify(items));
-      } catch {
-        // Ignore storage quota errors
-      }
+    try {
+      localStorage.setItem(LOCAL_ITEMS_KEY, JSON.stringify(items));
+    } catch {
+      // Ignore storage quota errors
     }
-  }, [items, user]);
+  }, [items]);
 
   useEffect(() => {
     try {
@@ -186,31 +270,43 @@ export function useScheduleStore() {
     }
   }, [preferences]);
 
-  // Listen to Firebase Auth state
+  // Listen to Firebase Auth state & redirect results
   useEffect(() => {
+    getRedirectResult(auth)
+      .then((res) => {
+        if (res?.user) {
+          setSyncError(null);
+        }
+      })
+      .catch((err) => {
+        console.warn('Redirect sign-in check:', err);
+      });
+
     const unsub = onAuthStateChanged(auth, (nextUser) => {
       setUser(nextUser);
       setAuthReady(true);
-      if (!nextUser) {
-        prefsDocExistsRef.current = false;
-        setItems(loadLocalItems());
-        setPreferences(loadLocalPrefs());
-        setCloudLoading(false);
+      if (nextUser?.email) {
+        setSyncError(null);
       }
     });
     return () => unsub();
   }, []);
 
-  // Attach Firestore real-time listeners once authenticated
+  // Attach Firestore real-time listeners whenever cloudTarget is active
   useEffect(() => {
-    if (!authReady || !user) return;
-    setCloudLoading(true);
-    setSyncError(null);
+    if (!authReady) return;
+    if (!cloudTarget) {
+      prefsDocExistsRef.current = false;
+      setCloudLoading(false);
+      return;
+    }
 
-    const itemsPath = `users/${user.uid}/items`;
+    setCloudLoading(true);
+    const { basePath, ownerId } = cloudTarget;
+    const itemsPath = `${basePath}/items`;
     const itemsQuery = query(
       collection(db, itemsPath),
-      where('userId', '==', user.uid)
+      where('userId', '==', ownerId)
     );
 
     const unsubItems = onSnapshot(
@@ -220,7 +316,7 @@ export function useScheduleStore() {
           const data = d.data();
           return {
             id: d.id,
-            userId: String(data.userId ?? user.uid),
+            userId: String(data.userId ?? ownerId),
             title: String(data.title ?? ''),
             notes: typeof data.notes === 'string' ? data.notes : '',
             category: data.category === 'work' ? 'work' : 'study',
@@ -247,23 +343,31 @@ export function useScheduleStore() {
           };
         });
 
-        // If user signs in for the first time and cloud is empty, migrate local items once
-        if (
-          remoteItems.length === 0 &&
-          hasMigratedLocalRef.current !== user.uid
-        ) {
-          hasMigratedLocalRef.current = user.uid;
+        // First-time migration of local items into the cloud room
+        if (hasMigratedRef.current !== ownerId) {
+          hasMigratedRef.current = ownerId;
           const localDrafts = loadLocalItems();
-          if (localDrafts.length > 0) {
+          const remoteIds = new Set(remoteItems.map((r) => r.id));
+
+          // If cloud is completely empty, upload all local items;
+          // if cloud already has items, only upload custom user-created items not yet on cloud
+          const toUpload =
+            remoteItems.length === 0
+              ? localDrafts
+              : localDrafts.filter(
+                  (it) => !it.id.startsWith('starter-') && !remoteIds.has(it.id)
+                );
+
+          if (toUpload.length > 0) {
             const batch = writeBatch(db);
-            for (const localItem of localDrafts) {
+            for (const localItem of toUpload) {
               const cleanId = ID_REGEX.test(localItem.id)
                 ? localItem.id
                 : generateSafeId();
               const clean = sanitizeDraft(localItem);
               batch.set(doc(db, itemsPath, cleanId), {
                 ...clean,
-                userId: user.uid,
+                userId: ownerId,
                 createdAt: serverTimestamp(),
                 updatedAt: serverTimestamp(),
               });
@@ -279,13 +383,13 @@ export function useScheduleStore() {
       },
       (error) => {
         setCloudLoading(false);
-        setSyncError('Không thể đồng bộ dữ liệu đám mây.');
+        setSyncError('Không thể đọc dữ liệu đồng bộ từ đám mây.');
         handleFirestoreError(error, OperationType.LIST, itemsPath);
       }
     );
 
-    const prefPath = `users/${user.uid}/settings/preferences`;
-    const prefDocRef = doc(db, `users/${user.uid}/settings`, 'preferences');
+    const prefPath = `${basePath}/settings/preferences`;
+    const prefDocRef = doc(db, `${basePath}/settings`, 'preferences');
     const unsubPrefs = onSnapshot(
       prefDocRef,
       (snap) => {
@@ -311,6 +415,19 @@ export function useScheduleStore() {
           );
         } else {
           prefsDocExistsRef.current = false;
+          // Seed initial preferences to cloud room so other devices get the current theme
+          const currentLocalPrefs = loadLocalPrefs();
+          setDoc(prefDocRef, {
+            ...currentLocalPrefs,
+            userId: ownerId,
+            updatedAt: serverTimestamp(),
+          })
+            .then(() => {
+              prefsDocExistsRef.current = true;
+            })
+            .catch(() => {
+              // Ignore initial preference seed error
+            });
         }
       },
       (error) => {
@@ -322,36 +439,76 @@ export function useScheduleStore() {
       unsubItems();
       unsubPrefs();
     };
-  }, [authReady, user]);
+  }, [authReady, cloudTarget]);
 
   const signInWithGoogle = useCallback(async () => {
     setAuthLoading(true);
     setSyncError(null);
     try {
-      await signInWithPopup(auth, googleProvider);
+      await signInWithPopup(auth, googleProvider, browserPopupRedirectResolver);
     } catch (err) {
-      setSyncError('Đăng nhập Google không thành công. Vui lòng thử lại.');
-      console.error(err);
+      setSyncError(describeAuthErrorVi(err));
+      console.error('Google Sign-In Popup Error:', err);
     } finally {
       setAuthLoading(false);
     }
   }, []);
 
-  const signOut = useCallback(async () => {
+  const signInWithGoogleRedirect = useCallback(async () => {
     setAuthLoading(true);
+    setSyncError(null);
     try {
-      await firebaseSignOut(auth);
-    } finally {
+      await signInWithRedirect(auth, googleProvider, browserPopupRedirectResolver);
+    } catch (err) {
+      setSyncError(describeAuthErrorVi(err));
       setAuthLoading(false);
     }
   }, []);
+
+  const connectWithSyncCode = useCallback((rawCode: string): boolean => {
+    const trimmed = rawCode.trim();
+    const key = normalizeToSyncKey(trimmed);
+    if (!key) {
+      setSyncError('Vui lòng nhập Email hoặc Mã đồng bộ tối thiểu 4 ký tự (chữ hoặc số).');
+      return false;
+    }
+    setSyncError(null);
+    hasMigratedRef.current = null;
+    prefsDocExistsRef.current = false;
+    setSyncCodeLabel(trimmed);
+    try {
+      localStorage.setItem(LOCAL_SYNC_CODE_KEY, trimmed);
+    } catch {
+      // Ignore storage error
+    }
+    return true;
+  }, []);
+
+  const signOut = useCallback(async () => {
+    setAuthLoading(true);
+    try {
+      if (user) {
+        await firebaseSignOut(auth);
+      }
+      setSyncCodeLabel('');
+      hasMigratedRef.current = null;
+      prefsDocExistsRef.current = false;
+      try {
+        localStorage.removeItem(LOCAL_SYNC_CODE_KEY);
+      } catch {
+        // Ignore
+      }
+    } finally {
+      setAuthLoading(false);
+    }
+  }, [user]);
 
   const addItem = useCallback(
     async (draft: ScheduleItemDraft) => {
       const clean = sanitizeDraft(draft);
       const id = generateSafeId();
 
-      if (!user) {
+      if (!cloudTarget) {
         const now = Date.now();
         const next: ScheduleItem = {
           ...clean,
@@ -364,11 +521,11 @@ export function useScheduleStore() {
         return;
       }
 
-      const path = `users/${user.uid}/items/${id}`;
+      const path = `${cloudTarget.basePath}/items/${id}`;
       try {
-        await setDoc(doc(db, `users/${user.uid}/items`, id), {
+        await setDoc(doc(db, `${cloudTarget.basePath}/items`, id), {
           ...clean,
-          userId: user.uid,
+          userId: cloudTarget.ownerId,
           createdAt: serverTimestamp(),
           updatedAt: serverTimestamp(),
         });
@@ -376,14 +533,14 @@ export function useScheduleStore() {
         handleFirestoreError(err, OperationType.CREATE, path);
       }
     },
-    [user]
+    [cloudTarget]
   );
 
   const updateItem = useCallback(
     async (id: string, draft: ScheduleItemDraft) => {
       const clean = sanitizeDraft(draft);
 
-      if (!user) {
+      if (!cloudTarget) {
         setItems((prev) =>
           prev.map((item) =>
             item.id === id ? { ...item, ...clean, updatedAt: Date.now() } : item
@@ -393,9 +550,9 @@ export function useScheduleStore() {
       }
 
       const safeId = ID_REGEX.test(id) ? id : generateSafeId();
-      const path = `users/${user.uid}/items/${safeId}`;
+      const path = `${cloudTarget.basePath}/items/${safeId}`;
       try {
-        await updateDoc(doc(db, `users/${user.uid}/items`, safeId), {
+        await updateDoc(doc(db, `${cloudTarget.basePath}/items`, safeId), {
           ...clean,
           updatedAt: serverTimestamp(),
         });
@@ -403,14 +560,14 @@ export function useScheduleStore() {
         handleFirestoreError(err, OperationType.UPDATE, path);
       }
     },
-    [user]
+    [cloudTarget]
   );
 
   const toggleComplete = useCallback(
     async (item: ScheduleItem) => {
       const nextCompleted = !item.completed;
 
-      if (!user) {
+      if (!cloudTarget) {
         setItems((prev) =>
           prev.map((it) =>
             it.id === item.id
@@ -421,9 +578,9 @@ export function useScheduleStore() {
         return;
       }
 
-      const path = `users/${user.uid}/items/${item.id}`;
+      const path = `${cloudTarget.basePath}/items/${item.id}`;
       try {
-        await updateDoc(doc(db, `users/${user.uid}/items`, item.id), {
+        await updateDoc(doc(db, `${cloudTarget.basePath}/items`, item.id), {
           completed: nextCompleted,
           snoozedUntil: 0,
           updatedAt: serverTimestamp(),
@@ -432,14 +589,14 @@ export function useScheduleStore() {
         handleFirestoreError(err, OperationType.UPDATE, path);
       }
     },
-    [user]
+    [cloudTarget]
   );
 
   const snoozeItem = useCallback(
     async (item: ScheduleItem, minutes: number) => {
       const snoozedUntil = Math.floor(Date.now() + minutes * 60 * 1000);
 
-      if (!user) {
+      if (!cloudTarget) {
         setItems((prev) =>
           prev.map((it) =>
             it.id === item.id ? { ...it, snoozedUntil, updatedAt: Date.now() } : it
@@ -448,9 +605,9 @@ export function useScheduleStore() {
         return;
       }
 
-      const path = `users/${user.uid}/items/${item.id}`;
+      const path = `${cloudTarget.basePath}/items/${item.id}`;
       try {
-        await updateDoc(doc(db, `users/${user.uid}/items`, item.id), {
+        await updateDoc(doc(db, `${cloudTarget.basePath}/items`, item.id), {
           snoozedUntil,
           updatedAt: serverTimestamp(),
         });
@@ -458,24 +615,24 @@ export function useScheduleStore() {
         handleFirestoreError(err, OperationType.UPDATE, path);
       }
     },
-    [user]
+    [cloudTarget]
   );
 
   const deleteItem = useCallback(
     async (id: string) => {
-      if (!user) {
+      if (!cloudTarget) {
         setItems((prev) => prev.filter((it) => it.id !== id));
         return;
       }
 
-      const path = `users/${user.uid}/items/${id}`;
+      const path = `${cloudTarget.basePath}/items/${id}`;
       try {
-        await deleteDoc(doc(db, `users/${user.uid}/items`, id));
+        await deleteDoc(doc(db, `${cloudTarget.basePath}/items`, id));
       } catch (err) {
         handleFirestoreError(err, OperationType.DELETE, path);
       }
     },
-    [user]
+    [cloudTarget]
   );
 
   const updatePreferences = useCallback(
@@ -483,10 +640,10 @@ export function useScheduleStore() {
       const merged = sanitizePreferences({ ...preferences, ...partial });
       setPreferences(merged);
 
-      if (!user) return;
+      if (!cloudTarget) return;
 
-      const path = `users/${user.uid}/settings/preferences`;
-      const ref = doc(db, `users/${user.uid}/settings`, 'preferences');
+      const path = `${cloudTarget.basePath}/settings/preferences`;
+      const ref = doc(db, `${cloudTarget.basePath}/settings`, 'preferences');
       try {
         if (prefsDocExistsRef.current) {
           await updateDoc(ref, {
@@ -496,7 +653,7 @@ export function useScheduleStore() {
         } else {
           await setDoc(ref, {
             ...merged,
-            userId: user.uid,
+            userId: cloudTarget.ownerId,
             updatedAt: serverTimestamp(),
           });
           prefsDocExistsRef.current = true;
@@ -505,14 +662,14 @@ export function useScheduleStore() {
         handleFirestoreError(err, OperationType.WRITE, path);
       }
     },
-    [preferences, user]
+    [preferences, cloudTarget]
   );
 
   const importBackupItems = useCallback(
     async (incomingItems: ScheduleItemDraft[]) => {
       const validDrafts = incomingItems.slice(0, 100).map(sanitizeDraft);
 
-      if (!user) {
+      if (!cloudTarget) {
         const now = Date.now();
         const mapped: ScheduleItem[] = validDrafts.map((d) => ({
           ...d,
@@ -525,13 +682,13 @@ export function useScheduleStore() {
         return mapped.length;
       }
 
-      const itemsPath = `users/${user.uid}/items`;
+      const itemsPath = `${cloudTarget.basePath}/items`;
       const batch = writeBatch(db);
       for (const draft of validDrafts) {
         const id = generateSafeId();
         batch.set(doc(db, itemsPath, id), {
           ...draft,
-          userId: user.uid,
+          userId: cloudTarget.ownerId,
           createdAt: serverTimestamp(),
           updatedAt: serverTimestamp(),
         });
@@ -543,11 +700,12 @@ export function useScheduleStore() {
         handleFirestoreError(err, OperationType.WRITE, itemsPath);
       }
     },
-    [user]
+    [cloudTarget]
   );
 
   return {
     user,
+    cloudTarget,
     authReady,
     authLoading,
     cloudLoading,
@@ -556,6 +714,8 @@ export function useScheduleStore() {
     preferences,
     isDark,
     signInWithGoogle,
+    signInWithGoogleRedirect,
+    connectWithSyncCode,
     signOut,
     addItem,
     updateItem,

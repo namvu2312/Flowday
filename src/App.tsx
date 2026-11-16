@@ -55,12 +55,15 @@ const NAV_TABS: { key: TabKey; label: string; Icon: React.FC<{ className?: strin
 export default function App() {
   const {
     user,
+    cloudTarget,
     authLoading,
     cloudLoading,
     syncError,
     items,
     preferences,
     signInWithGoogle,
+    signInWithGoogleRedirect,
+    connectWithSyncCode,
     signOut,
     addItem,
     updateItem,
@@ -348,9 +351,9 @@ export default function App() {
             <p className="mt-1 text-xs text-slate-500 dark:text-slate-400">
               {cloudLoading
                 ? 'Đang đồng bộ dữ liệu đám mây...'
-                : user
-                ? `Đã bật đồng bộ đám mây (${user.displayName || user.email})`
-                : 'Đang lưu trên thiết bị · Có thể đăng nhập Google để đồng bộ đa thiết bị'}
+                : cloudTarget
+                ? `Đang đồng bộ đám mây (${cloudTarget.displayLabel})`
+                : 'Đang lưu trên thiết bị · Chọn "Kết nối Đồng bộ" để liên kết iPhone & Laptop'}
             </p>
           </div>
 
@@ -367,24 +370,23 @@ export default function App() {
               <span>Đồng bộ Lịch iCloud (.ics)</span>
             </button>
 
-            {user ? (
+            {cloudTarget ? (
               <button
                 type="button"
                 onClick={() => setActiveTab('settings')}
                 className="ios-glass-control min-h-[40px] inline-flex items-center gap-1.5 rounded-xl px-3 py-1.5 text-xs font-medium text-slate-700 dark:text-slate-200 hover:bg-white/85 dark:hover:bg-white/10 transition-colors whitespace-nowrap shrink-0"
               >
                 <CloudCheck className="h-3.5 w-3.5 text-emerald-600 dark:text-emerald-400" />
-                <span>Đã đồng bộ Đám mây</span>
+                <span>Đã đồng bộ: {cloudTarget.displayLabel}</span>
               </button>
             ) : (
               <button
                 type="button"
-                onClick={() => void signInWithGoogle()}
-                disabled={authLoading}
-                className="ios-glass-control min-h-[40px] inline-flex items-center gap-1.5 rounded-xl px-3 py-1.5 text-xs font-medium text-slate-700 dark:text-slate-200 hover:bg-white/85 dark:hover:bg-white/10 transition-colors whitespace-nowrap shrink-0"
+                onClick={() => setActiveTab('settings')}
+                className="ios-glass-control min-h-[40px] inline-flex items-center gap-1.5 rounded-xl px-3 py-1.5 text-xs font-semibold text-slate-800 dark:text-slate-100 hover:bg-white/85 dark:hover:bg-white/10 transition-colors whitespace-nowrap shrink-0"
               >
                 <Cloud className="h-3.5 w-3.5" style={{ color: 'var(--accent)' }} />
-                <span>Đăng nhập đồng bộ</span>
+                <span>Kết nối Đồng bộ (iPhone & Laptop)</span>
               </button>
             )}
           </div>
@@ -688,12 +690,15 @@ export default function App() {
         {activeTab === 'settings' && (
           <SettingsView
             user={user}
+            cloudTarget={cloudTarget}
             authLoading={authLoading}
             syncError={syncError}
             items={items}
             preferences={preferences}
             onUpdatePreferences={updatePreferences}
             onSignIn={signInWithGoogle}
+            onSignInRedirect={signInWithGoogleRedirect}
+            onConnectSyncCode={connectWithSyncCode}
             onSignOut={signOut}
             onImportBackup={importBackupItems}
             onToast={showToast}

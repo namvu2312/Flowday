@@ -11,6 +11,10 @@ service cloud.firestore {
       return id is string && id.size() >= 1 && id.size() <= 128 && id.matches('^[a-zA-Z0-9_\\-]+$');
     }
 
+    function isValidSyncKey(syncKey) {
+      return syncKey is string && syncKey.size() >= 8 && syncKey.size() <= 96 && syncKey.matches('^sync_[a-zA-Z0-9_\\-]+$');
+    }
+
     function incoming() {
       return request.resource.data;
     }
@@ -27,7 +31,7 @@ service cloud.firestore {
       return isSignedIn() && request.auth.token.email_verified == true && request.auth.uid == userId && isValidId(userId);
     }
 
-    function isValidScheduleItem(data) {
+    function isValidScheduleItemForOwner(data, expectedOwnerId) {
       return data.keys().hasAll([
           'userId',
           'title',
@@ -58,7 +62,7 @@ service cloud.firestore {
           'createdAt',
           'updatedAt'
         ])
-        && data.userId is string && isValidId(data.userId) && data.userId == request.auth.uid
+        && data.userId is string && isValidId(data.userId) && data.userId == expectedOwnerId
         && data.title is string && data.title.size() >= 1 && data.title.size() <= 140
         && (!('notes' in data) || (data.notes is string && data.notes.size() <= 500))
         && data.category in ['study', 'work']
@@ -76,7 +80,7 @@ service cloud.firestore {
         && data.updatedAt is timestamp;
     }
 
-    function isValidUserPreferences(data) {
+    function isValidUserPreferencesForOwner(data, expectedOwnerId) {
       return data.keys().hasAll([
           'userId',
           'themeMode',
@@ -103,7 +107,7 @@ service cloud.firestore {
           'smartLeadLow',
           'updatedAt'
         ])
-        && data.userId is string && isValidId(data.userId) && data.userId == request.auth.uid
+        && data.userId is string && isValidId(data.userId) && data.userId == expectedOwnerId
         && data.themeMode in ['light', 'dark', 'system']
         && data.accentColor is string && data.accentColor.size() == 7 && data.accentColor.matches('^#[0-9a-fA-F]{6}$')
         && data.quietHoursEnabled is bool
@@ -121,13 +125,13 @@ service cloud.firestore {
       allow list: if isVerifiedOwner(userId) && resource.data.userId == request.auth.uid;
       allow create: if isVerifiedOwner(userId)
         && isValidId(itemId)
-        && isValidScheduleItem(incoming())
+        && isValidScheduleItemForOwner(incoming(), request.auth.uid)
         && incoming().userId == userId
         && incoming().createdAt == request.time
         && incoming().updatedAt == request.time;
       allow update: if isVerifiedOwner(userId)
         && isValidId(itemId)
-        && isValidScheduleItem(incoming())
+        && isValidScheduleItemForOwner(incoming(), request.auth.uid)
         && incoming().userId == existing().userId
         && incoming().createdAt == existing().createdAt
         && incoming().updatedAt == request.time
@@ -147,13 +151,13 @@ service cloud.firestore {
       allow create: if isVerifiedOwner(userId)
         && isValidId(settingId)
         && settingId == 'preferences'
-        && isValidUserPreferences(incoming())
+        && isValidUserPreferencesForOwner(incoming(), request.auth.uid)
         && incoming().userId == userId
         && incoming().updatedAt == request.time;
       allow update: if isVerifiedOwner(userId)
         && isValidId(settingId)
         && settingId == 'preferences'
-        && isValidUserPreferences(incoming())
+        && isValidUserPreferencesForOwner(incoming(), request.auth.uid)
         && incoming().userId == existing().userId
         && incoming().updatedAt == request.time
         && incoming().diff(existing()).affectedKeys().hasOnly([
@@ -161,6 +165,53 @@ service cloud.firestore {
           'quietHoursEnd', 'pushEnabled', 'smartLeadHigh', 'smartLeadMedium', 'smartLeadLow', 'updatedAt'
         ]);
       allow delete: if isVerifiedOwner(userId) && isValidId(settingId) && settingId == 'preferences' && existing().userId == request.auth.uid;
+    }
+
+    match /syncRooms/{syncKey}/items/{itemId} {
+      allow get: if isValidSyncKey(syncKey) && isValidId(itemId) && (resource == null || existing().userId == syncKey);
+      allow list: if isValidSyncKey(syncKey) && resource.data.userId == syncKey;
+      allow create: if isValidSyncKey(syncKey)
+        && isValidId(itemId)
+        && isValidScheduleItemForOwner(incoming(), syncKey)
+        && incoming().userId == syncKey
+        && incoming().createdAt == request.time
+        && incoming().updatedAt == request.time;
+      allow update: if isValidSyncKey(syncKey)
+        && isValidId(itemId)
+        && isValidScheduleItemForOwner(incoming(), syncKey)
+        && incoming().userId == existing().userId
+        && incoming().createdAt == existing().createdAt
+        && incoming().updatedAt == request.time
+        && (
+          incoming().diff(existing()).affectedKeys().hasOnly(['completed', 'snoozedUntil', 'updatedAt'])
+          || incoming().diff(existing()).affectedKeys().hasOnly([
+            'title', 'notes', 'category', 'date', 'startTime', 'endTime',
+            'priority', 'repeat', 'reminderMinutes', 'completed', 'snoozedUntil', 'updatedAt'
+          ])
+        );
+      allow delete: if isValidSyncKey(syncKey) && isValidId(itemId) && existing().userId == syncKey;
+    }
+
+    match /syncRooms/{syncKey}/settings/{settingId} {
+      allow get: if isValidSyncKey(syncKey) && isValidId(settingId) && settingId == 'preferences' && (resource == null || existing().userId == syncKey);
+      allow list: if isValidSyncKey(syncKey) && resource.data.userId == syncKey;
+      allow create: if isValidSyncKey(syncKey)
+        && isValidId(settingId)
+        && settingId == 'preferences'
+        && isValidUserPreferencesForOwner(incoming(), syncKey)
+        && incoming().userId == syncKey
+        && incoming().updatedAt == request.time;
+      allow update: if isValidSyncKey(syncKey)
+        && isValidId(settingId)
+        && settingId == 'preferences'
+        && isValidUserPreferencesForOwner(incoming(), syncKey)
+        && incoming().userId == existing().userId
+        && incoming().updatedAt == request.time
+        && incoming().diff(existing()).affectedKeys().hasOnly([
+          'themeMode', 'accentColor', 'quietHoursEnabled', 'quietHoursStart',
+          'quietHoursEnd', 'pushEnabled', 'smartLeadHigh', 'smartLeadMedium', 'smartLeadLow', 'updatedAt'
+        ]);
+      allow delete: if isValidSyncKey(syncKey) && isValidId(settingId) && settingId == 'preferences' && existing().userId == syncKey;
     }
   }
 }

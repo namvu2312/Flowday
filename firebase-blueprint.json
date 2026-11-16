@@ -7,7 +7,7 @@
       "properties": {
         "userId": {
           "type": "string",
-          "description": "Owner Firebase Auth UID.",
+          "description": "Owner Firebase Auth UID or Sync Room Key.",
           "minLength": 1,
           "maxLength": 128,
           "pattern": "^[a-zA-Z0-9_\\-]+$"
@@ -104,7 +104,7 @@
       "properties": {
         "userId": {
           "type": "string",
-          "description": "Owner Firebase Auth UID.",
+          "description": "Owner Firebase Auth UID or Sync Room Key.",
           "minLength": 1,
           "maxLength": 128,
           "pattern": "^[a-zA-Z0-9_\\-]+$"
@@ -181,13 +181,25 @@
       "schema": {
         "$ref": "#/entities/ScheduleItem"
       },
-      "description": "User's personal study and work schedule items."
+      "description": "User's personal study and work schedule items synced via Google Auth."
     },
     "/users/{userId}/settings/{settingId}": {
       "schema": {
         "$ref": "#/entities/UserPreferences"
       },
-      "description": "User's theme and smart reminder settings."
+      "description": "User's theme and smart reminder settings synced via Google Auth."
+    },
+    "/syncRooms/{syncKey}/items/{itemId}": {
+      "schema": {
+        "$ref": "#/entities/ScheduleItem"
+      },
+      "description": "Cross-device schedule items synced via a secret sync key between iPhone and Laptop."
+    },
+    "/syncRooms/{syncKey}/settings/{settingId}": {
+      "schema": {
+        "$ref": "#/entities/UserPreferences"
+      },
+      "description": "Cross-device theme and reminder settings synced via a secret sync key between iPhone and Laptop."
     }
   }
 }
