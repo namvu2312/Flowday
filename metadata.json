@@ -1,0 +1,6 @@
+{
+  "name": "FlowDay — Lịch Học & Làm việc",
+  "description": "Ứng dụng lịch học tập và làm việc cá nhân chuẩn iOS với thẻ tổng quan widget, nhắc nhở thông minh, đồng bộ đám mây và xuất lịch iCloud.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}

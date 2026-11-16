@@ -1,0 +1,166 @@
+rules_version = '2';
+
+service cloud.firestore {
+  match /databases/{database}/documents {
+    // Global Safety Net: default deny
+    match /{document=**} {
+      allow read, write: if false;
+    }
+
+    function isValidId(id) {
+      return id is string && id.size() >= 1 && id.size() <= 128 && id.matches('^[a-zA-Z0-9_\\-]+$');
+    }
+
+    function incoming() {
+      return request.resource.data;
+    }
+
+    function existing() {
+      return resource.data;
+    }
+
+    function isSignedIn() {
+      return request.auth != null;
+    }
+
+    function isVerifiedOwner(userId) {
+      return isSignedIn() && request.auth.token.email_verified == true && request.auth.uid == userId && isValidId(userId);
+    }
+
+    function isValidScheduleItem(data) {
+      return data.keys().hasAll([
+          'userId',
+          'title',
+          'category',
+          'date',
+          'startTime',
+          'endTime',
+          'priority',
+          'repeat',
+          'reminderMinutes',
+          'completed',
+          'createdAt',
+          'updatedAt'
+        ])
+        && data.keys().hasOnly([
+          'userId',
+          'title',
+          'notes',
+          'category',
+          'date',
+          'startTime',
+          'endTime',
+          'priority',
+          'repeat',
+          'reminderMinutes',
+          'completed',
+          'snoozedUntil',
+          'createdAt',
+          'updatedAt'
+        ])
+        && data.userId is string && isValidId(data.userId) && data.userId == request.auth.uid
+        && data.title is string && data.title.size() >= 1 && data.title.size() <= 140
+        && (!('notes' in data) || (data.notes is string && data.notes.size() <= 500))
+        && data.category in ['study', 'work']
+        && data.date is string && data.date.size() == 10 && data.date.matches('^[0-9]{4}-[0-9]{2}-[0-9]{2}$')
+        && data.startTime is string && data.startTime.size() == 5 && data.startTime.matches('^([01][0-9]|2[0-3]):[0-5][0-9]$')
+        && data.endTime is string && data.endTime.size() == 5 && data.endTime.matches('^([01][0-9]|2[0-3]):[0-5][0-9]$')
+        && data.priority in ['high', 'medium', 'low']
+        && data.repeat in ['none', 'daily', 'weekdays', 'weekly']
+        && data.reminderMinutes is list
+        && data.reminderMinutes.size() <= 5
+        && (data.reminderMinutes.size() == 0 || (data.reminderMinutes[0] is int && data.reminderMinutes[0] >= 0 && data.reminderMinutes[0] <= 1440))
+        && data.completed is bool
+        && (!('snoozedUntil' in data) || (data.snoozedUntil is int && data.snoozedUntil >= 0))
+        && data.createdAt is timestamp
+        && data.updatedAt is timestamp;
+    }
+
+    function isValidUserPreferences(data) {
+      return data.keys().hasAll([
+          'userId',
+          'themeMode',
+          'accentColor',
+          'quietHoursEnabled',
+          'quietHoursStart',
+          'quietHoursEnd',
+          'pushEnabled',
+          'smartLeadHigh',
+          'smartLeadMedium',
+          'smartLeadLow',
+          'updatedAt'
+        ])
+        && data.keys().hasOnly([
+          'userId',
+          'themeMode',
+          'accentColor',
+          'quietHoursEnabled',
+          'quietHoursStart',
+          'quietHoursEnd',
+          'pushEnabled',
+          'smartLeadHigh',
+          'smartLeadMedium',
+          'smartLeadLow',
+          'updatedAt'
+        ])
+        && data.userId is string && isValidId(data.userId) && data.userId == request.auth.uid
+        && data.themeMode in ['light', 'dark', 'system']
+        && data.accentColor is string && data.accentColor.size() == 7 && data.accentColor.matches('^#[0-9a-fA-F]{6}$')
+        && data.quietHoursEnabled is bool
+        && data.quietHoursStart is string && data.quietHoursStart.size() == 5 && data.quietHoursStart.matches('^([01][0-9]|2[0-3]):[0-5][0-9]$')
+        && data.quietHoursEnd is string && data.quietHoursEnd.size() == 5 && data.quietHoursEnd.matches('^([01][0-9]|2[0-3]):[0-5][0-9]$')
+        && data.pushEnabled is bool
+        && data.smartLeadHigh is int && data.smartLeadHigh >= 0 && data.smartLeadHigh <= 1440
+        && data.smartLeadMedium is int && data.smartLeadMedium >= 0 && data.smartLeadMedium <= 1440
+        && data.smartLeadLow is int && data.smartLeadLow >= 0 && data.smartLeadLow <= 1440
+        && data.updatedAt is timestamp;
+    }
+
+    match /users/{userId}/items/{itemId} {
+      allow get: if isVerifiedOwner(userId) && isValidId(itemId) && (resource == null || existing().userId == request.auth.uid);
+      allow list: if isVerifiedOwner(userId) && resource.data.userId == request.auth.uid;
+      allow create: if isVerifiedOwner(userId)
+        && isValidId(itemId)
+        && isValidScheduleItem(incoming())
+        && incoming().userId == userId
+        && incoming().createdAt == request.time
+        && incoming().updatedAt == request.time;
+      allow update: if isVerifiedOwner(userId)
+        && isValidId(itemId)
+        && isValidScheduleItem(incoming())
+        && incoming().userId == existing().userId
+        && incoming().createdAt == existing().createdAt
+        && incoming().updatedAt == request.time
+        && (
+          incoming().diff(existing()).affectedKeys().hasOnly(['completed', 'snoozedUntil', 'updatedAt'])
+          || incoming().diff(existing()).affectedKeys().hasOnly([
+            'title', 'notes', 'category', 'date', 'startTime', 'endTime',
+            'priority', 'repeat', 'reminderMinutes', 'completed', 'snoozedUntil', 'updatedAt'
+          ])
+        );
+      allow delete: if isVerifiedOwner(userId) && isValidId(itemId) && existing().userId == request.auth.uid;
+    }
+
+    match /users/{userId}/settings/{settingId} {
+      allow get: if isVerifiedOwner(userId) && isValidId(settingId) && settingId == 'preferences' && (resource == null || existing().userId == request.auth.uid);
+      allow list: if isVerifiedOwner(userId) && resource.data.userId == request.auth.uid;
+      allow create: if isVerifiedOwner(userId)
+        && isValidId(settingId)
+        && settingId == 'preferences'
+        && isValidUserPreferences(incoming())
+        && incoming().userId == userId
+        && incoming().updatedAt == request.time;
+      allow update: if isVerifiedOwner(userId)
+        && isValidId(settingId)
+        && settingId == 'preferences'
+        && isValidUserPreferences(incoming())
+        && incoming().userId == existing().userId
+        && incoming().updatedAt == request.time
+        && incoming().diff(existing()).affectedKeys().hasOnly([
+          'themeMode', 'accentColor', 'quietHoursEnabled', 'quietHoursStart',
+          'quietHoursEnd', 'pushEnabled', 'smartLeadHigh', 'smartLeadMedium', 'smartLeadLow', 'updatedAt'
+        ]);
+      allow delete: if isVerifiedOwner(userId) && isValidId(settingId) && settingId == 'preferences' && existing().userId == request.auth.uid;
+    }
+  }
+}
